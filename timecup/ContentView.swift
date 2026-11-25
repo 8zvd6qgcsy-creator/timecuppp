@@ -184,17 +184,7 @@ final class SharedAnimationClock: NSObject, ObservableObject {
         guard displayLink == nil else { return }
         
         let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        
-        if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(
-                minimum: 80,
-                maximum: 120,
-                preferred: 90
-            )
-        } else {
-            link.preferredFramesPerSecond = 90
-        }
-        
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 90)
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
@@ -1873,7 +1863,7 @@ struct EventEditorView: View {
         _startDate = State(initialValue: editingEvent?.startDate ?? Date())
         _endDate = State(
             initialValue: editingEvent?.endDate ??
-            Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+            Calendar.current.date(byAdding: .day, value: 1, to: Date()) ?? Date().addingTimeInterval(86_400)
         )
         _note = State(initialValue: editingEvent?.note ?? "")
         _showInWidget = State(initialValue: editingEvent?.showInWidget ?? true)
