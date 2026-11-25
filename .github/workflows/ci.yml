@@ -1,0 +1,51 @@
+name: build
+
+# 公开仓库的 macOS 分钟数是免费的，所以每次 push / PR 都真编译一遍，
+# 用来兜住「在 Windows 上改 Swift 只能静态检查」这个短板。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          echo "--- simulator SDK ---"
+          xcrun --sdk iphonesimulator --show-sdk-version
+          echo "--- runtimes ---"
+          xcrun simctl list runtimes | head -10
+
+      - name: Warn when the runner SDK is older than the project target
+        run: |
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          case "$SDK" in
+            26.*|27.*) echo "runner SDK $SDK 可以覆盖工程部署目标 26.4" ;;
+            *) echo "::warning::runner SDK 是 $SDK，低于工程部署目标 26.4，编译大概率失败；把 project.pbxproj 的 IPHONEOS_DEPLOYMENT_TARGET 降到这个 SDK 以下即可" ;;
+          esac
+
+      - name: List targets and schemes
+        run: xcodebuild -project timecup.xcodeproj -list
+
+      # 用 -target 而不是 -scheme：仓库里没有共享 scheme，
+      # CI 上是干净检出，-scheme 会直接报 "scheme not found"。
+      - name: Build app and widget extension (unsigned, simulator)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project timecup.xcodeproj \
+            -target timecup \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
