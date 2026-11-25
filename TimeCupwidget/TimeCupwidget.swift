@@ -95,24 +95,35 @@ struct TCYearCupProvider: TimelineProvider {
     
     func getTimeline(in context: Context, completion: @escaping (Timeline<TCYearCupEntry>) -> Void) {
         let now = Date()
-        
-        let nextRefresh = Calendar.current.date(
-            byAdding: .minute,
-            value: 30,
-            to: now
-        ) ?? now.addingTimeInterval(1800)
-        
-        let entry = TCYearCupEntry(
-            date: now,
-            events: TCWidgetEventReader.loadEvents()
+        let calendar = Calendar.current
+        let events = TCWidgetEventReader.loadEvents()
+
+        // 只在「画面真的会变」的时间点重画，而不是每 30 分钟盲刷一次：
+        //   - 今天结束（年度水杯翻页、今日圆环归零）
+        //   - 每个事件的结束时刻（进行中 → 已结束）
+        // 其余时间的秒级走字交给 Text(timerInterval:)，不占 WidgetKit 的刷新预算。
+        var boundaries: [Date] = []
+        if let midnight = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)) {
+            boundaries.append(midnight)
+        }
+        boundaries.append(contentsOf: events.map(\.endDate).filter { $0 > now })
+
+        // WidgetKit 要求同一批 entry 之间至少隔约 5 分钟，一天也就 40–70 次；这里最多排 4 个
+        let horizon = now.addingTimeInterval(12 * 3_600)
+        let stamps = Array(
+            boundaries
+                .filter { $0 > now.addingTimeInterval(5 * 60) && $0 < horizon }
+                .sorted()
+                .prefix(4)
         )
-        
-        completion(
-            Timeline(
-                entries: [entry],
-                policy: .after(nextRefresh)
-            )
-        )
+
+        var entries = [TCYearCupEntry(date: now, events: events)]
+        entries.append(contentsOf: stamps.map { TCYearCupEntry(date: $0, events: events) })
+
+        // 兜底：最后再排一次，万一上面的边界都没命中也不至于停在旧画面上
+        let last = entries.last?.date ?? now
+        let refresh = min(last.addingTimeInterval(6 * 3_600), horizon)
+        completion(Timeline(entries: entries, policy: .after(refresh)))
     }
     
     private var sampleEvents: [TCWidgetEvent] {
@@ -290,10 +301,28 @@ struct TCWidgetEventRow: View {
                 ProgressView(value: event.progress(at: date))
                     .tint(.blue)
                 
-                Text(event.remainingText(at: date))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                remainingView
             }
+        }
+    }
+    
+    /// 进行中的事件交给系统计时器自己走秒，不需要刷新时间线；
+    /// 未开始 / 已结束是静态状态，用普通文字。
+    @ViewBuilder
+    private var remainingView: some View {
+        if event.endDate <= date {
+            Text("已结束")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else if event.startDate > date {
+            Text("未开始")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else {
+            Text(timerInterval: date...event.endDate, countsDown: true)
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -571,12 +600,8 @@ struct TCYearInfo {
 // MARK: - Background
 
 extension View {
-    @ViewBuilder
+    /// 部署目标就是 iOS 17，小组件内容必须放进 containerBackground，不需要再写 else 兜底分支
     func tcWidgetBackground() -> some View {
-        if #available(iOSApplicationExtension 17.0, *) {
-            self.containerBackground(.fill.tertiary, for: .widget)
-        } else {
-            self.background(Color(.systemBackground))
-        }
+        containerBackground(.fill.tertiary, for: .widget)
     }
 }

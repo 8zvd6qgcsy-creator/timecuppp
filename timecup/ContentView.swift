@@ -185,14 +185,12 @@ final class SharedAnimationClock: NSObject, ObservableObject {
         
         let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
         
-        if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(
-                minimum: 80,
-                maximum: 120,
-                preferred: 90
-            )
+        // 低电量模式降到 30fps：一杯水不该比导航更费电。
+        // 注意：这里只在时钟真正启动时读一次系统状态，中途开关低电量模式要重新订阅才生效。
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 20, maximum: 30, preferred: 30)
         } else {
-            link.preferredFramesPerSecond = 90
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 90)
         }
         
         link.add(to: .main, forMode: .common)
@@ -220,6 +218,10 @@ final class MotionManager: ObservableObject {
     @Published var x: Double = 0
     @Published var y: Double = 0
     
+    /// 上一次真正发出去的值，用来过滤细微抖动
+    private var lastX = 0.0
+    private var lastY = 0.0
+    
     private init() { }
     
     func resume() {
@@ -227,33 +229,47 @@ final class MotionManager: ObservableObject {
         running = true
         
         if manager.isDeviceMotionAvailable {
-            manager.deviceMotionUpdateInterval = 1.0 / 90.0
+            // 重力变化很慢，30Hz 完全够用；原来 90Hz 等于让 SwiftUI 每秒多画 60 帧没必要的图
+            manager.deviceMotionUpdateInterval = 1.0 / 30.0
             
             manager.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
-                guard let data else { return }
+                guard let self = self, let data = data else { return }
                 
                 let gravity = data.gravity
                 let user = data.userAcceleration
                 
-                self?.x = gravity.x + user.x * 0.45
-                self?.y = gravity.y + user.y * 0.38
+                self.publish(
+                    x: gravity.x + user.x * 0.45,
+                    y: gravity.y + user.y * 0.38
+                )
             }
         } else if manager.isAccelerometerAvailable {
-            manager.accelerometerUpdateInterval = 1.0 / 90.0
+            manager.accelerometerUpdateInterval = 1.0 / 30.0
             
             manager.startAccelerometerUpdates(to: .main) { [weak self] data, _ in
-                guard let data else { return }
+                guard let self = self, let data = data else { return }
                 
-                self?.x = data.acceleration.x
-                self?.y = data.acceleration.y
+                self.publish(x: data.acceleration.x, y: data.acceleration.y)
             }
         }
+    }
+    
+    /// 变化小于阈值就不发通知：手机平放时这条链路完全不触发 SwiftUI 重绘
+    private func publish(x: Double, y: Double) {
+        guard abs(x - lastX) > 0.008 || abs(y - lastY) > 0.008 else { return }
+        
+        lastX = x
+        lastY = y
+        self.x = x
+        self.y = y
     }
     
     func pause() {
         running = false
         manager.stopDeviceMotionUpdates()
         manager.stopAccelerometerUpdates()
+        lastX = 0
+        lastY = 0
         x = 0
         y = 0
     }
@@ -266,6 +282,9 @@ final class EventStore: ObservableObject {
     
     private let key = "timecup_events_final_v2"
     private let appGroupID = "group.com.liuhua.timecup"
+    
+    /// 攒起来的小组件刷新任务，见 scheduleWidgetReload()
+    private var pendingWidgetReload: DispatchWorkItem?
     
     private var sharedDefaults: UserDefaults {
         UserDefaults(suiteName: appGroupID) ?? .standard
@@ -295,11 +314,23 @@ final class EventStore: ObservableObject {
             let data = try JSONEncoder().encode(events)
             sharedDefaults.set(data, forKey: key)
             
-            // 关键：通知桌面小组件刷新
-            WidgetCenter.shared.reloadAllTimelines()
+            // 连续编辑时每次存盘都 reload 会把小组件的刷新预算烧光，攒一下再刷
+            scheduleWidgetReload()
         } catch {
             print("保存失败：\(error)")
         }
+    }
+    
+    /// 1.2 秒内的多次保存合并成一次 reloadAllTimelines
+    private func scheduleWidgetReload() {
+        pendingWidgetReload?.cancel()
+        
+        let work = DispatchWorkItem {
+            WidgetCenter.shared.reloadAllTimelines()
+        }
+        
+        pendingWidgetReload = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: work)
     }
     
     func add(
@@ -929,26 +960,36 @@ struct BubbleLayer: View {
     let size: CGSize
     
     var body: some View {
-        let safeProgress = min(max(progress, 0), 1)
-        let waterTop = size.height * (1 - safeProgress)
-        
-        ZStack {
-            ForEach(0..<20, id: \.self) { index in
-                let baseX = CGFloat((index * 47) % 100) / 100.0 * size.width
+        // 20 个气泡以前是 20 个 SwiftUI 子视图，90fps 下每帧都要重新求值、布局、提交图层；
+        // 气泡不参与点击，改成一张 Canvas 一次画完，视图树里只剩一个节点。
+        Canvas { context, canvasSize in
+            let safeProgress = min(max(progress, 0), 1)
+            let height = max(canvasSize.height, 1)
+            let waterTop = canvasSize.height * (1 - safeProgress)
+            let width = canvasSize.width
+            let bubbleColor = Color(.systemBackground).opacity(0.24)
+            
+            for index in 0..<20 {
+                let baseX = CGFloat((index * 47) % 100) / 100.0 * width
                 let speed = Double(index % 5 + 4)
-                let offset = CGFloat((phase * speed + Double(index * 31)).truncatingRemainder(dividingBy: Double(max(size.height, 1))))
+                let offset = CGFloat((phase * speed + Double(index * 31)).truncatingRemainder(dividingBy: Double(height)))
                 let bubbleSize = CGFloat(4 + (index % 4) * 3)
                 let x = baseX + CGFloat(motionX) * 24 + CGFloat(sin(phase * 2 + Double(index))) * 12
-                let y = size.height - offset
+                let y = canvasSize.height - offset
                 
-                if y > waterTop {
-                    Circle()
-                        .fill(Color(.systemBackground).opacity(0.24))
-                        .frame(width: bubbleSize, height: bubbleSize)
-                        .position(x: x, y: y)
-                }
+                guard y > waterTop else { continue }
+                
+                let rect = CGRect(
+                    x: x - bubbleSize / 2,
+                    y: y - bubbleSize / 2,
+                    width: bubbleSize,
+                    height: bubbleSize
+                )
+                
+                context.fill(Path(ellipseIn: rect), with: .color(bubbleColor))
             }
         }
+        .allowsHitTesting(false)
     }
 }
 
@@ -1873,7 +1914,7 @@ struct EventEditorView: View {
         _startDate = State(initialValue: editingEvent?.startDate ?? Date())
         _endDate = State(
             initialValue: editingEvent?.endDate ??
-            Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+            Calendar.current.date(byAdding: .day, value: 1, to: Date()) ?? Date().addingTimeInterval(86_400)
         )
         _note = State(initialValue: editingEvent?.note ?? "")
         _showInWidget = State(initialValue: editingEvent?.showInWidget ?? true)
